@@ -4,169 +4,113 @@
 
 #include "bufferManager.h"
 
-void push(Node** head, int value) {
-	Node* newNode = new Node();
-	newNode->value = value;
-	if (*head == NULL) {
-		newNode->next = newNode->prev = newNode;
-		*head = newNode;
-	} else {
-		Node* tail = (*head)->prev;
-		newNode->next = *head;
-		newNode->prev = tail;
-		tail->next = newNode;
-		(*head)->prev = newNode;
-	}
-}
-
-Node* search(Node** head, int value) {
-	if (*head == NULL) {
-		return NULL;
-	}
-	Node* current = *head;
-	do {
-		if (current->value == value) {
-			return current;
-		}
-		current = current->next;
-	} while (current != *head);
-	return NULL;
-}
-
-void remove(Node** head, Node* node) {
-	if (node == NULL || *head == NULL) return;
-	if (node->next == node) { // Only one node in the list
-		*head = NULL;
-	} else {
-		Node* nextNode = node->next;
-		Node* prevNode = node->prev;
-		prevNode->next = nextNode;
-		nextNode->prev = prevNode;
-		if (node == *head) {
-			*head = nextNode;
-		}
-	}
-	delete node;
-}
-
-void move(Node** head, int value) {
-	Node* node = search(head, value);
-	if (node) {
-		remove(head, node);
-		push(head, value);
-	}
-}
-
-int pop(Node** head) {
-	if (*head == NULL) {
-		std::cerr << "List is empty." << std::endl;
-		return -1; // or throw an exception
-	}
-	Node* oldHead = *head;
-	int data = oldHead->value;
-	if (oldHead->next == oldHead) { // Only one node in the list
-		*head = NULL;
-	} else {
-		Node* newHead = oldHead->next;
-		Node* tail = oldHead->prev;
-		tail->next = newHead;
-		newHead->prev = tail;
-		*head = newHead;
-	}
-	delete oldHead;
-	return data;
-}
-
-void printList(Node* head) {
-	if (head == NULL) return;
-	Node* current = head;
-	do {
-		std::cout << current->value << " ";
-		current = current->next;
-	} while (current != head);
-	std::cout << std::endl;
-}
-
-bufferManager::bufferManager(int numBlocks, int blockSize, int numFrames): bufferpool(blockSize, numFrames) {
+bufferManager::bufferManager(int blockSize, int numFrames): buffPool(blockSize, numFrames) {
 	this->numFrames = numFrames;
 	this->bufferSize = blockSize*numFrames;
-	string myString = "";
+	// incializar hit y miss count
+	hitCount = 0;
+	missCount = 0;
+	//inicializar lista freeFrames
 	int i;
-	//inicializar LRUhead
-	LRUHead = NULL;
-	//inicializar freeFrames
-	for(i=0; i<numFrames; i++)
-	{
-		freeFrames.push(i);
-	}
-	//inicializar directorio de bloques
-	directorio.resize(numBlocks);
-	for(i=0; i<numBlocks; i++)
-	{
-		myString = "Bloque: "+std::to_string(i);
-		directorio[i] = new Bloque(blockSize);
-		directorio[i]->escribirBloque(myString);
-	}
+	for(i=0; i<numFrames; i++) freeFrames.push(i);
+}
+
+void bufferManager::setDiskManRef(DiskManager *diskManRef) {
+	this->diskManRef = diskManRef;
 }
 
 string * bufferManager::getPage(int pageId) {
+	// pinear pagina
 	pinPage(pageId);
+	// retornar direccion del frame que sostiene a la pagina
 	int frameId = get<0>(pageTable[pageId]);
-	return bufferpool.getFrameDirection(frameId);
+	return buffPool.getFrameDirection(frameId);
 }
 
-// recibira una pagina que esta en un frame
-void bufferManager::flushPage(int pageId) {
-	//la escribira en disco
-	if(get<1>(pageTable[pageId])) {
-		string * contenidoActual = bufferpool.getFrameDirection(get<0>(pageTable[pageId]));
-		directorio[pageId]->escribirBloque(*contenidoActual);
+void bufferManager::flushPage(int pageId) { // recibira una pagina que esta en un frame
+	if(get<2>(pageTable[pageId]) != 0) {
+		cerr << "No se puede liberar la pagina " << pageId << " porque esta siendo usada" << endl;
+		return;
+	}
+	if(get<1>(pageTable[pageId])) { // la escribira en disco si dirtyflag es true
+		string* contenidoActual = buffPool.getFrameDirection(get<0>(pageTable[pageId]));
+		diskManRef->writeBlock(pageId, *contenidoActual);
 	}
 	//liberar frame
-	pageTable.erase(pageId);
-	freeFrames.push(get<0>(pageTable[pageId]));
-	cerr<<"Flushing page: "<<pageId<<endl;
+	freeFrames.push(get<0>(pageTable[pageId]));// agregar frameId a la lista de frames libres
+	pageTable.erase(pageId);// eliminar seguimiento de la pagina del pagetable
+	LRUqueue.pop_front();// eliminar pagina de la cola LRU
+	cerr<<"Flushing page: "<<pageId<<endl; // mensaje de depuracion
 }
 
 void bufferManager::pinPage(int pageId) {
-	if(pageTable.find(pageId) == pageTable.end())
+	if(pageTable.find(pageId) == pageTable.end()) // Si la pagina no esta en el bufferPool
 	{
-		cerr<<"Page not found in buffer"<<endl;
+		cout<<"misscount ++"<<endl;
 		missCount++;
-		//Buscar frames que mo sostengan bloques
-		//Si no hay frames disponibles
-		if(freeFrames.size() == 0) {
-			int page;
-			int pincountPage;
-			do {
-				page = pop(&LRUHead);// sacar pagina de LRU queue
-				pincountPage = get<2>(pageTable[page]);
-			}while(pincountPage);
-			flushPage(page);
+		if(freeFrames.size() == 0) { //Si no hay frames disponibles
+			int page = LRUqueue.front();
+			flushPage(page);// liberamos el frame de la cabecera de la LRUqueue
 		}
-
 		//reservar frame
 		int freeFrame = freeFrames.front();
 		freeFrames.pop();
 		//escribir contenido del bloque en el frame
-		*bufferpool.getFrameDirection(freeFrame) = *directorio[pageId]->leerBloque();
-		//registrar en el pagetable y el LRU
+		*buffPool.getFrameDirection(freeFrame) = diskManRef->readBlock(pageId);
+		//registrar en el pagetable
 		pageTable[pageId] = make_tuple(freeFrame, false, 0);
-		//push pagina en LRU queue
-		push(&LRUHead, pageId);
 	} else {
+		if(get<2>(pageTable[pageId]) == 0) { // Si esta unpinned
+			for (auto it = LRUqueue.begin(); it != LRUqueue.end(); ++it) {
+				if (*it == pageId) {
+					LRUqueue.erase(it); //lo retiramos del LRUqueue
+					break;
+				}
+			}
+		}
+		cout<<"hitcount ++"<<endl;
 		hitCount++;
 	}
-	//incrementar pincount
-	get<2>(pageTable[pageId])++;
-	//actualizar posicion de la pagina en LRU queue
-	move(&LRUHead, pageId);
+	get<2>(pageTable[pageId])++; //incrementar pincount
 }
 
 void bufferManager::unpinPage(int pageId) {
-	get<2>(pageTable[pageId])--;
+	if((--get<2>(pageTable[pageId])) == 0)// decrementar pincount y verificar si esta unpinned
+		LRUqueue.push_back(pageId); //intrducir la pagina en LRU queue
 }
 
 void bufferManager::setDirtyFlag(int pageId) {
 	get<1>(pageTable[pageId]) = true;
+}
+
+int bufferManager::getMissCount() {
+	return missCount;
+}
+
+int bufferManager::getHitcount() {
+	return hitCount;
+}
+
+void bufferManager::printPageTable() {
+	cout << "\t----------------------------------------------" << endl;
+	cout << "\t| Page ID | Frame ID | dirty bit | pin count |" << endl;
+	for (const auto& entry : pageTable) {
+		int key = entry.first;
+		const tuple<int, bool, int>& value = entry.second;
+
+		int firstElement = get<0>(value);
+		int secondElement = get<1>(value);
+		int thirdElement = get<2>(value);
+
+		cout << "\t----------------------------------------------" << endl;
+		cout << "\t|    " << key << "    |    " << firstElement << "     |     " << secondElement << "     |     " << thirdElement << "     |" << endl;
+	}
+	cout << "\t----------------------------------------------\n" << endl;
+}
+
+void bufferManager::printLRUqueue() {
+	for (const int& item : LRUqueue) {
+		cout << "| " << item << " | <- ";
+	}
+	cout << "end\n" << endl;
 }
